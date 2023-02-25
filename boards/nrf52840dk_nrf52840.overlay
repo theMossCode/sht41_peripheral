@@ -1,0 +1,10 @@
+&i2c0 {
+    status = "okay";
+    sht41: sht41@44{
+        compatible = "sensirion,sht4x";
+        status = "okay";
+        reg = < 0x44 >;
+        repeatability = < 2 >;
+        label = "sht41_sensor"; // For compatibility with previous ncs versions
+    };
+};

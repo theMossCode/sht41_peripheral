@@ -1,25 +1,23 @@
-.. _ble_peripheral:
+.. _sht41_peripheral:
 
-Bluetooth: Peripheral
+Bluetooth: SHT41 Peripheral
 #####################
 
 Overview
 ********
 
-Application demonstrating the BLE Peripheral role. It has several well-known and
-vendor-specific GATT services that it exposes.
+SHT41 bluetooth server that reads data from a SHT41 temperature and humidity sensor and notifies the client with the sensor values every 15 minutes.
 
 
 Requirements
 ************
 
-* BlueZ running on the host, or
-* A board with BLE support
+nrf52 board.
+SHT41 sensor
 
 Building and Running
 ********************
 
-This sample can be found under :zephyr_file:`samples/bluetooth/peripheral` in the
-Zephyr tree.
+Build tested on ncs 2.2.0
 
-See :ref:`bluetooth samples section <bluetooth-samples>` for details.
+The application will advertise the main service once started. Sensor reading and notifications will begin once a connection has been established

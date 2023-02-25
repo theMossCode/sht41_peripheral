@@ -6,398 +6,329 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <zephyr/kernel.h>
 #include <zephyr/types.h>
 #include <stddef.h>
 #include <string.h>
 #include <errno.h>
-#include <sys/printk.h>
-#include <sys/byteorder.h>
-#include <zephyr.h>
 
-#include <settings/settings.h>
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/sensor.h>
+#include <zephyr/logging/log.h>
 
-#include <bluetooth/bluetooth.h>
-#include <bluetooth/hci.h>
-#include <bluetooth/conn.h>
-#include <bluetooth/uuid.h>
-#include <bluetooth/gatt.h>
-#include <bluetooth/services/bas.h>
-#include <bluetooth/services/hrs.h>
-#include <bluetooth/services/ias.h>
+LOG_MODULE_REGISTER(MAIN);
 
-#include "cts.h"
+#define MAIN_SERVICE_UUID	BT_UUID_128_ENCODE(0xedd1a5f3, 0xdbb0, 0x4b29, 0xb449, 0xa4be5161f18e)
+#define RX_UUID				BT_UUID_128_ENCODE(0xedd1a5f3, 0xdbb2, 0x4b29, 0xb449, 0xa4be5161f18e)
+#define TX_UUID				BT_UUID_128_ENCODE(0xedd1a5f3, 0xdbb3, 0x4b29, 0xb449, 0xa4be5161f18e)
 
-/* Custom Service Variables */
-#define BT_UUID_CUSTOM_SERVICE_VAL \
-	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
+#define MAIN_EVT_TIMER_EXPIRY			0x01
+#define MAIN_EVT_BLE_RESP_RECEIVED		0x02
 
-static struct bt_uuid_128 vnd_uuid = BT_UUID_INIT_128(
-	BT_UUID_CUSTOM_SERVICE_VAL);
+#define TIMER_INTERVAL_MINUTES			1
 
-static struct bt_uuid_128 vnd_enc_uuid = BT_UUID_INIT_128(
-	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef1));
+#define BLE_PASSKEY						123456
 
-static struct bt_uuid_128 vnd_auth_uuid = BT_UUID_INIT_128(
-	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef2));
+#define SHT41_NODE						DT_NODELABEL(sht41)
 
-#define VND_MAX_LEN 20
-
-static uint8_t vnd_value[VND_MAX_LEN + 1] = { 'V', 'e', 'n', 'd', 'o', 'r'};
-static uint8_t vnd_auth_value[VND_MAX_LEN + 1] = { 'V', 'e', 'n', 'd', 'o', 'r'};
-static uint8_t vnd_wwr_value[VND_MAX_LEN + 1] = { 'V', 'e', 'n', 'd', 'o', 'r' };
-
-static ssize_t read_vnd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-			void *buf, uint16_t len, uint16_t offset)
-{
-	const char *value = attr->user_data;
-
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, value,
-				 strlen(value));
-}
-
-static ssize_t write_vnd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-			 const void *buf, uint16_t len, uint16_t offset,
-			 uint8_t flags)
-{
-	uint8_t *value = attr->user_data;
-
-	if (offset + len > VND_MAX_LEN) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
-	}
-
-	memcpy(value + offset, buf, len);
-	value[offset + len] = 0;
-
-	return len;
-}
-
-static uint8_t simulate_vnd;
-static uint8_t indicating;
-static struct bt_gatt_indicate_params ind_params;
-
-static void vnd_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
-{
-	simulate_vnd = (value == BT_GATT_CCC_INDICATE) ? 1 : 0;
-}
-
-static void indicate_cb(struct bt_conn *conn,
-			struct bt_gatt_indicate_params *params, uint8_t err)
-{
-	printk("Indication %s\n", err != 0U ? "fail" : "success");
-}
-
-static void indicate_destroy(struct bt_gatt_indicate_params *params)
-{
-	printk("Indication complete\n");
-	indicating = 0U;
-}
-
-#define VND_LONG_MAX_LEN 74
-static uint8_t vnd_long_value[VND_LONG_MAX_LEN + 1] = {
-		  'V', 'e', 'n', 'd', 'o', 'r', ' ', 'd', 'a', 't', 'a', '1',
-		  'V', 'e', 'n', 'd', 'o', 'r', ' ', 'd', 'a', 't', 'a', '2',
-		  'V', 'e', 'n', 'd', 'o', 'r', ' ', 'd', 'a', 't', 'a', '3',
-		  'V', 'e', 'n', 'd', 'o', 'r', ' ', 'd', 'a', 't', 'a', '4',
-		  'V', 'e', 'n', 'd', 'o', 'r', ' ', 'd', 'a', 't', 'a', '5',
-		  'V', 'e', 'n', 'd', 'o', 'r', ' ', 'd', 'a', 't', 'a', '6',
-		  '.', ' ' };
-
-static ssize_t write_long_vnd(struct bt_conn *conn,
-			      const struct bt_gatt_attr *attr, const void *buf,
-			      uint16_t len, uint16_t offset, uint8_t flags)
-{
-	uint8_t *value = attr->user_data;
-
-	if (flags & BT_GATT_WRITE_FLAG_PREPARE) {
-		return 0;
-	}
-
-	if (offset + len > VND_LONG_MAX_LEN) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
-	}
-
-	memcpy(value + offset, buf, len);
-	value[offset + len] = 0;
-
-	return len;
-}
-
-static const struct bt_uuid_128 vnd_long_uuid = BT_UUID_INIT_128(
-	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef3));
-
-static struct bt_gatt_cep vnd_long_cep = {
-	.properties = BT_GATT_CEP_RELIABLE_WRITE,
+struct sht41_data{
+	double temp;
+	double rh;
 };
 
-static int signed_value;
+static ssize_t rx_chr_written(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+static ssize_t tx_chr_read_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static void tx_chr_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value);
 
-static ssize_t read_signed(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-			   void *buf, uint16_t len, uint16_t offset)
-{
-	const char *value = attr->user_data;
+static void connected_cb(struct bt_conn *conn, uint8_t err);
+static void disconnected_cb(struct bt_conn *conn, uint8_t reason);
+static void security_changed_cb(struct bt_conn *conn, bt_security_t level, enum bt_security_err err);
 
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, value,
-				 sizeof(signed_value));
-}
+static void pair_cancel(struct bt_conn *conn);
+static void pairing_confirm(struct bt_conn *conn);
 
-static ssize_t write_signed(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-			    const void *buf, uint16_t len, uint16_t offset,
-			    uint8_t flags)
-{
-	uint8_t *value = attr->user_data;
+static void pairing_complete(struct bt_conn *conn, bool bonded);
+static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason);
+static void bond_deleted(uint8_t id, const bt_addr_le_t *peer);
 
-	if (offset + len > sizeof(signed_value)) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
-	}
+static void sensor_timer_expiry_handler(struct k_timer *timer);
 
-	memcpy(value + offset, buf, len);
+const struct bt_uuid_128 main_service_uuid = BT_UUID_INIT_128(MAIN_SERVICE_UUID);
+const struct bt_uuid_128 tx_uuid = BT_UUID_INIT_128(TX_UUID);
+const struct bt_uuid_128 rx_uuid = BT_UUID_INIT_128(RX_UUID);
+struct bt_conn *conn;
 
-	return len;
-}
+struct bt_conn_cb conn_callbacks = {
+	.connected = connected_cb,
+	.disconnected = disconnected_cb,
+	.security_changed = security_changed_cb
+};
+struct bt_conn_auth_cb conn_auth_callbacks = {
+	.cancel = pair_cancel,
+	.pairing_confirm = pairing_confirm
+};
+struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
+	.pairing_complete = pairing_complete,
+	.pairing_failed = pairing_failed,
+	.bond_deleted = bond_deleted
+};
 
-static const struct bt_uuid_128 vnd_signed_uuid = BT_UUID_INIT_128(
-	BT_UUID_128_ENCODE(0x13345678, 0x1234, 0x5678, 0x1334, 0x56789abcdef3));
+bool notifications_enabled = false;
 
-static const struct bt_uuid_128 vnd_write_cmd_uuid = BT_UUID_INIT_128(
-	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef4));
+const struct device *sht41 = DEVICE_DT_GET(SHT41_NODE);
+struct sht41_data sht41_sensor_data;
 
-static ssize_t write_without_rsp_vnd(struct bt_conn *conn,
-				     const struct bt_gatt_attr *attr,
-				     const void *buf, uint16_t len, uint16_t offset,
-				     uint8_t flags)
-{
-	uint8_t *value = attr->user_data;
+// Sensor timer definition
+K_TIMER_DEFINE(sensor_timer, sensor_timer_expiry_handler, NULL);
 
-	if (!(flags & BT_GATT_WRITE_FLAG_CMD)) {
-		/* Write Request received. Reject it since this Characteristic
-		 * only accepts Write Without Response.
-		 */
-		return BT_GATT_ERR(BT_ATT_ERR_WRITE_REQ_REJECTED);
-	}
+// Events
+K_EVENT_DEFINE(main_evts);
 
-	if (offset + len > VND_MAX_LEN) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
-	}
+static const struct bt_data adv_data [] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, MAIN_SERVICE_UUID)
+};
 
-	memcpy(value + offset, buf, len);
-	value[offset + len] = 0;
-
-	return len;
-}
-
-/* Vendor Primary Service Declaration */
-BT_GATT_SERVICE_DEFINE(vnd_svc,
-	BT_GATT_PRIMARY_SERVICE(&vnd_uuid),
-	BT_GATT_CHARACTERISTIC(&vnd_enc_uuid.uuid,
-			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE |
-			       BT_GATT_CHRC_INDICATE,
-			       BT_GATT_PERM_READ_ENCRYPT |
-			       BT_GATT_PERM_WRITE_ENCRYPT,
-			       read_vnd, write_vnd, vnd_value),
-	BT_GATT_CCC(vnd_ccc_cfg_changed,
-		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_ENCRYPT),
-	BT_GATT_CHARACTERISTIC(&vnd_auth_uuid.uuid,
-			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
-			       BT_GATT_PERM_READ_AUTHEN |
-			       BT_GATT_PERM_WRITE_AUTHEN,
-			       read_vnd, write_vnd, vnd_auth_value),
-	BT_GATT_CHARACTERISTIC(&vnd_long_uuid.uuid, BT_GATT_CHRC_READ |
-			       BT_GATT_CHRC_WRITE | BT_GATT_CHRC_EXT_PROP,
-			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE |
-			       BT_GATT_PERM_PREPARE_WRITE,
-			       read_vnd, write_long_vnd, &vnd_long_value),
-	BT_GATT_CEP(&vnd_long_cep),
-	BT_GATT_CHARACTERISTIC(&vnd_signed_uuid.uuid, BT_GATT_CHRC_READ |
-			       BT_GATT_CHRC_WRITE | BT_GATT_CHRC_AUTH,
-			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
-			       read_signed, write_signed, &signed_value),
-	BT_GATT_CHARACTERISTIC(&vnd_write_cmd_uuid.uuid,
-			       BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-			       BT_GATT_PERM_WRITE, NULL,
-			       write_without_rsp_vnd, &vnd_wwr_value),
+BT_GATT_SERVICE_DEFINE(primary_service, 
+	BT_GATT_PRIMARY_SERVICE(BT_UUID_DECLARE_128(MAIN_SERVICE_UUID)),
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(RX_UUID), BT_GATT_CHRC_WRITE, BT_GATT_PERM_WRITE, NULL, rx_chr_written, NULL),
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(TX_UUID), BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_READ, tx_chr_read_cb, NULL, NULL),
+	BT_GATT_CCC(tx_chr_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 );
 
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA_BYTES(BT_DATA_UUID16_ALL,
-		      BT_UUID_16_ENCODE(BT_UUID_HRS_VAL),
-		      BT_UUID_16_ENCODE(BT_UUID_BAS_VAL),
-		      BT_UUID_16_ENCODE(BT_UUID_CTS_VAL)),
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_CUSTOM_SERVICE_VAL),
-};
-
-void mtu_updated(struct bt_conn *conn, uint16_t tx, uint16_t rx)
+static ssize_t rx_chr_written(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
-	printk("Updated MTU: TX: %d RX: %d bytes\n", tx, rx);
+	LOG_DBG("Data Received");
+	const uint8_t *data = (char *) buf;
+	if(data[0] == 0x00){
+		LOG_INF("Response received");
+		k_event_set(&main_evts, MAIN_EVT_BLE_RESP_RECEIVED);
+	}
+	else if(data[0] == 0x01){
+		// retry
+		LOG_DBG("Retry");
+		k_timer_start(&sensor_timer, K_SECONDS(15), K_SECONDS(15));
+	}
+	else{
+		LOG_DBG("Unexpected response %d", data[0]);
+	}
+
+	return len;
 }
 
-static struct bt_gatt_cb gatt_callbacks = {
-	.att_mtu_updated = mtu_updated
-};
-
-static void connected(struct bt_conn *conn, uint8_t err)
+static ssize_t tx_chr_read_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset)
 {
-	if (err) {
-		printk("Connection failed (err 0x%02x)\n", err);
-	} else {
-		printk("Connected\n");
+	LOG_DBG("TX read");
+	return 0;
+}
+
+static void tx_chr_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+	if(value){
+		notifications_enabled = true;
+		// start timer
+		k_timer_start(&sensor_timer, K_MINUTES(TIMER_INTERVAL_MINUTES), K_MINUTES(TIMER_INTERVAL_MINUTES));
+		LOG_INF("TX notifications enabled");
+	}
+	else{
+		notifications_enabled = false;
+		// stop timer to conserve power
+		k_timer_stop(&sensor_timer);
+		LOG_WRN("TX notifications disabled");
 	}
 }
 
-static void disconnected(struct bt_conn *conn, uint8_t reason)
+static void connected_cb(struct bt_conn *conn, uint8_t err)
 {
-	printk("Disconnected (reason 0x%02x)\n", reason);
+	LOG_INF("Device connected, %d", err);
+	bt_conn_ref(conn);
 }
 
-static void alert_stop(void)
+static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 {
-	printk("Alert stopped\n");
+	LOG_WRN("Device disconnected %d", reason);
+	bt_conn_unref(conn);
 }
 
-static void alert_start(void)
+static void security_changed_cb(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
 {
-	printk("Mild alert started\n");
-}
-
-static void alert_high_start(void)
-{
-	printk("High alert started\n");
-}
-
-BT_CONN_CB_DEFINE(conn_callbacks) = {
-	.connected = connected,
-	.disconnected = disconnected,
-};
-
-BT_IAS_CB_DEFINE(ias_callbacks) = {
-	.no_alert = alert_stop,
-	.mild_alert = alert_start,
-	.high_alert = alert_high_start,
-};
-
-static void bt_ready(void)
-{
-	int err;
-
-	printk("Bluetooth initialized\n");
-
-	cts_init();
-
-	if (IS_ENABLED(CONFIG_SETTINGS)) {
-		settings_load();
-	}
-
-	err = bt_le_adv_start(BT_LE_ADV_CONN_NAME, ad, ARRAY_SIZE(ad), NULL, 0);
-	if (err) {
-		printk("Advertising failed to start (err %d)\n", err);
+	if(err){
+		LOG_ERR("Updated security error %d", err);
 		return;
 	}
 
-	printk("Advertising successfully started\n");
+	LOG_DBG("Security updated to %d", level);
 }
 
-static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
+static void pair_cancel(struct bt_conn *conn)
 {
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Passkey for %s: %06u\n", addr, passkey);
+	// Not used
+	LOG_DBG("Cancel pairing");
 }
 
-static void auth_cancel(struct bt_conn *conn)
+static void pairing_confirm(struct bt_conn *conn)
 {
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Pairing cancelled: %s\n", addr);
-}
-
-static struct bt_conn_auth_cb auth_cb_display = {
-	.passkey_display = auth_passkey_display,
-	.passkey_entry = NULL,
-	.cancel = auth_cancel,
-};
-
-static void bas_notify(void)
-{
-	uint8_t battery_level = bt_bas_get_battery_level();
-
-	battery_level--;
-
-	if (!battery_level) {
-		battery_level = 100U;
+	if(bt_conn_auth_pairing_confirm(conn)){
+		LOG_ERR("Confirm pairing error");
+		return;
 	}
 
-	bt_bas_set_battery_level(battery_level);
+	LOG_DBG("Pairing confirm");
 }
 
-static void hrs_notify(void)
+static void pairing_complete(struct bt_conn *conn, bool bonded)
 {
-	static uint8_t heartrate = 90U;
+	LOG_INF("Pairing complete");
+}
 
-	/* Heartrate measurements simulation */
-	heartrate++;
-	if (heartrate == 160U) {
-		heartrate = 90U;
+static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+{
+	LOG_ERR("Pairing fail, reason %d", reason);
+}
+
+static void bond_deleted(uint8_t id, const bt_addr_le_t *peer)
+{
+	LOG_DBG("Bond info deleted!");
+}
+
+static void sensor_timer_expiry_handler(struct k_timer *timer)
+{
+	// set timer expiry event
+	k_event_set(&main_evts, MAIN_EVT_TIMER_EXPIRY);
+}
+
+static int ble_init()
+{
+	int ret = 0;
+	ret = bt_enable(NULL);
+	if(ret){
+		LOG_ERR("Bluetooth enable error %d", ret);
+		return ret;
 	}
 
-	bt_hrs_notify(heartrate);
+	bt_conn_cb_register(&conn_callbacks);
+
+	ret = bt_conn_auth_cb_register(&conn_auth_callbacks);
+	if(ret){
+		LOG_ERR("Authentication callbacks register fail");
+		return ret;
+	}
+
+	ret = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
+	if(ret){
+		LOG_ERR("Authentication info callbacks register fail");
+		return ret;
+	}
+	LOG_DBG("Callbacks registered");
+
+	ret = bt_passkey_set(BLE_PASSKEY);
+	if(ret){
+		LOG_ERR("Set fixed passkey fail");
+		return ret;
+	}
+
+	ret = bt_le_adv_start(BT_LE_ADV_CONN_NAME, adv_data, ARRAY_SIZE(adv_data), NULL, 0);
+	if(ret){
+		LOG_ERR("Error starting advertising");
+		return ret;
+	}
+
+	LOG_INF("BLE advertising started");
+
+	return 0;
+}
+
+static int sht41_fetch_data()
+{
+	int ret = 0;
+	struct sensor_value t;
+	struct sensor_value rh;
+	ret = sensor_sample_fetch(sht41);
+	if(ret){
+		LOG_DBG("Sample fetch error");
+		return ret;
+	}
+
+	ret = sensor_channel_get(sht41, SENSOR_CHAN_AMBIENT_TEMP, &t);
+	if(ret){
+		LOG_ERR("Error getting ambient temperature");
+		return ret;
+	}
+
+	ret = sensor_channel_get(sht41, SENSOR_CHAN_HUMIDITY, &rh);
+	if(ret){
+		LOG_ERR("Error getting relative humidity");
+		return ret;
+	}
+
+	sht41_sensor_data.temp = sensor_value_to_double(&t);
+	sht41_sensor_data.rh = sensor_value_to_double(&rh);
+
+	return 0;
+}
+
+static int sht41_init()
+{
+	if(!device_is_ready(sht41)){
+		LOG_ERR("%s device not ready", sht41->name);
+		return -ENODEV;
+	}
+
+	return 0;
 }
 
 void main(void)
 {
-	struct bt_gatt_attr *vnd_ind_attr;
-	char str[BT_UUID_STR_LEN];
-	int err;
-
-	err = bt_enable(NULL);
-	if (err) {
-		printk("Bluetooth init failed (err %d)\n", err);
+	int res = 0;
+	uint32_t event;
+	int16_t notify_buffer[2];
+	if(ble_init()){
 		return;
 	}
 
-	bt_ready();
+	if(sht41_init()){
+		return;
+	}
 
-	bt_gatt_cb_register(&gatt_callbacks);
-	bt_conn_auth_cb_register(&auth_cb_display);
+	while(1){
+		event = k_event_wait(&main_evts, MAIN_EVT_TIMER_EXPIRY, true, K_FOREVER);
+		if(!(event & MAIN_EVT_TIMER_EXPIRY)){
+			LOG_WRN("Unexpected event %d", event);
+			continue;
+		}
 
-	vnd_ind_attr = bt_gatt_find_by_uuid(vnd_svc.attrs, vnd_svc.attr_count,
-					    &vnd_enc_uuid.uuid);
-	bt_uuid_to_str(&vnd_enc_uuid.uuid, str, sizeof(str));
-	printk("Indicate VND attr %p (UUID %s)\n", vnd_ind_attr, str);
+		res = sht41_fetch_data();
+		if(res){
+			LOG_ERR("Error %d fetching sensor data", res);
+			// restart timer with shorter duration
+			k_timer_start(&sensor_timer, K_SECONDS(15), K_SECONDS(15));
+			continue;
+		}
 
-	/* Implement notification. At the moment there is no suitable way
-	 * of starting delayed work so we do it here
-	 */
-	while (1) {
-		k_sleep(K_SECONDS(1));
+		if(notifications_enabled){
+			notify_buffer[0] = (int16_t)(sht41_sensor_data.temp * 100);
+			notify_buffer[1] = (int16_t)(sht41_sensor_data.rh * 100);
 
-		/* Current Time Service updates only when time is changed */
-		cts_notify();
-
-		/* Heartrate measurements simulation */
-		hrs_notify();
-
-		/* Battery level simulation */
-		bas_notify();
-
-		/* Vendor indication simulation */
-		if (simulate_vnd && vnd_ind_attr) {
-			if (indicating) {
+			res = bt_gatt_notify(conn, &primary_service.attrs[3], (const void *)notify_buffer, sizeof(notify_buffer));
+			if(res){
+				LOG_WRN("Notify error %d", res);
+				k_timer_start(&sensor_timer, K_SECONDS(15), K_SECONDS(15));				
 				continue;
 			}
-
-			ind_params.attr = vnd_ind_attr;
-			ind_params.func = indicate_cb;
-			ind_params.destroy = indicate_destroy;
-			ind_params.data = &indicating;
-			ind_params.len = sizeof(indicating);
-
-			if (bt_gatt_indicate(NULL, &ind_params) == 0) {
-				indicating = 1U;
-			}
 		}
+
+		event = k_event_wait(&main_evts, MAIN_EVT_BLE_RESP_RECEIVED, true, K_SECONDS(5));
+		if(!(event & MAIN_EVT_BLE_RESP_RECEIVED)){
+			LOG_WRN("BLE wait resp timeout");
+			k_timer_start(&sensor_timer, K_SECONDS(15), K_SECONDS(15));
+			continue;
+		}
+
+		// reset timer
+		k_timer_start(&sensor_timer, K_MINUTES(TIMER_INTERVAL_MINUTES), K_MINUTES(TIMER_INTERVAL_MINUTES));
 	}
 }
