@@ -50,6 +50,8 @@ static void security_changed_cb(struct bt_conn *conn, bt_security_t level, enum 
 
 static void pair_cancel(struct bt_conn *conn);
 static void pairing_confirm(struct bt_conn *conn);
+static void passkey_display(struct bt_conn *conn, unsigned int passkey);
+static void passkey_confirm(struct bt_conn *conn, unsigned int passkey);
 
 static void pairing_complete(struct bt_conn *conn, bool bonded);
 static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason);
@@ -69,7 +71,9 @@ struct bt_conn_cb conn_callbacks = {
 };
 struct bt_conn_auth_cb conn_auth_callbacks = {
 	.cancel = pair_cancel,
-	.pairing_confirm = pairing_confirm
+	.pairing_confirm = pairing_confirm,
+	.passkey_display = passkey_display,
+	.passkey_confirm = NULL,
 };
 struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
 	.pairing_complete = pairing_complete,
@@ -81,6 +85,8 @@ bool notifications_enabled = false;
 
 const struct device *sht41 = DEVICE_DT_GET(SHT41_NODE);
 struct sht41_data sht41_sensor_data;
+
+unsigned int pair_passkey = 0;
 
 // Sensor timer definition
 K_TIMER_DEFINE(sensor_timer, sensor_timer_expiry_handler, NULL);
@@ -178,6 +184,32 @@ static void pairing_confirm(struct bt_conn *conn)
 	}
 
 	LOG_DBG("Pairing confirm");
+}
+
+static void passkey_display(struct bt_conn *conn, unsigned int passkey)
+{
+	LOG_DBG("Display passkey %u", passkey);
+	pair_passkey = passkey;
+}
+
+static void passkey_confirm(struct bt_conn *conn, unsigned int passkey)
+{
+	int err = 0;
+	if(passkey == pair_passkey){
+		LOG_DBG("Passkey confirm");
+		err = bt_conn_auth_passkey_confirm(conn);
+		if(err){
+			LOG_ERR("Confirm passkey error %d", err);
+		}
+	}
+	else{
+		LOG_ERR("Passkey mismatch %u vs %u", pair_passkey, passkey);
+		err = bt_conn_auth_cancel(conn);
+		if(err){
+			LOG_ERR("Cancel authentication error");
+		}
+	}
+	
 }
 
 static void pairing_complete(struct bt_conn *conn, bool bonded)
@@ -291,7 +323,7 @@ void main(void)
 	}
 
 	if(sht41_init()){
-		return;
+		// return;
 	}
 
 	while(1){
