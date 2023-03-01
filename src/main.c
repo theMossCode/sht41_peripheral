@@ -26,10 +26,17 @@ LOG_MODULE_REGISTER(MAIN);
 #define RX_UUID				BT_UUID_128_ENCODE(0xedd1a5f3, 0xdbb2, 0x4b29, 0xb449, 0xa4be5161f18e)
 #define TX_UUID				BT_UUID_128_ENCODE(0xedd1a5f3, 0xdbb3, 0x4b29, 0xb449, 0xa4be5161f18e)
 
-#define MAIN_EVT_TIMER_EXPIRY			0x01
-#define MAIN_EVT_BLE_RESP_RECEIVED		0x02
+#define MAIN_EVT_TIMER_EXPIRY				0x01
+#define MAIN_EVT_BLE_RESP_RECEIVED			0x02
+#define MAIN_EVT_BLE_NOTIFICATION_ENABLED	0x04
+#define MAIN_EVT_BLE_CONNECTED				0x08
+#define MAIN_EVT_BLE_DISCONNECTED			0x10
 
-#define TIMER_INTERVAL_MINUTES			15
+#define NOTIFY_STATUS_OK					0x00
+#define NOTIFY_STATUS_WAIT					0x01
+#define NOTIFY_STATUS_ERROR					0xff
+
+#define TIMER_INTERVAL_MINUTES			1
 
 #define BLE_PASSKEY						123456
 
@@ -62,7 +69,7 @@ static void sensor_timer_expiry_handler(struct k_timer *timer);
 const struct bt_uuid_128 main_service_uuid = BT_UUID_INIT_128(MAIN_SERVICE_UUID);
 const struct bt_uuid_128 tx_uuid = BT_UUID_INIT_128(TX_UUID);
 const struct bt_uuid_128 rx_uuid = BT_UUID_INIT_128(RX_UUID);
-struct bt_conn *conn;
+struct bt_conn *default_conn = NULL;
 
 struct bt_conn_cb conn_callbacks = {
 	.connected = connected_cb,
@@ -72,8 +79,8 @@ struct bt_conn_cb conn_callbacks = {
 struct bt_conn_auth_cb conn_auth_callbacks = {
 	.cancel = pair_cancel,
 	.pairing_confirm = pairing_confirm,
+	// .passkey_confirm = passkey_confirm,
 	.passkey_display = passkey_display,
-	.passkey_confirm = NULL,
 };
 struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
 	.pairing_complete = pairing_complete,
@@ -113,11 +120,12 @@ static ssize_t rx_chr_written(struct bt_conn *conn, const struct bt_gatt_attr *a
 	if(data[0] == 0x00){
 		LOG_INF("Response received");
 		k_event_set(&main_evts, MAIN_EVT_BLE_RESP_RECEIVED);
+		k_timer_start(&sensor_timer, K_MINUTES(TIMER_INTERVAL_MINUTES), K_MINUTES(TIMER_INTERVAL_MINUTES));
 	}
 	else if(data[0] == 0x01){
 		// retry
 		LOG_DBG("Retry");
-		k_timer_start(&sensor_timer, K_SECONDS(15), K_SECONDS(15));
+		k_timer_start(&sensor_timer, K_SECONDS(1), K_MINUTES(TIMER_INTERVAL_MINUTES));
 	}
 	else{
 		LOG_DBG("Unexpected response %d", data[0]);
@@ -136,14 +144,11 @@ static void tx_chr_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
 	if(value){
 		notifications_enabled = true;
-		// start timer
-		k_timer_start(&sensor_timer, K_MINUTES(TIMER_INTERVAL_MINUTES), K_MINUTES(TIMER_INTERVAL_MINUTES));
+		k_event_set(&main_evts, MAIN_EVT_BLE_NOTIFICATION_ENABLED);
 		LOG_INF("TX notifications enabled");
 	}
 	else{
 		notifications_enabled = false;
-		// stop timer to conserve power
-		k_timer_stop(&sensor_timer);
 		LOG_WRN("TX notifications disabled");
 	}
 }
@@ -151,13 +156,16 @@ static void tx_chr_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 static void connected_cb(struct bt_conn *conn, uint8_t err)
 {
 	LOG_INF("Device connected, %d", err);
-	bt_conn_ref(conn);
+	default_conn = bt_conn_ref(conn);
+	k_event_set(&main_evts, MAIN_EVT_BLE_CONNECTED);
 }
 
 static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 {
 	LOG_WRN("Device disconnected %d", reason);
-	bt_conn_unref(conn);
+	bt_conn_unref(default_conn);
+	default_conn = NULL;
+	k_event_set(&main_evts, MAIN_EVT_BLE_DISCONNECTED);
 }
 
 static void security_changed_cb(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
@@ -230,17 +238,99 @@ static void bond_deleted(uint8_t id, const bt_addr_le_t *peer)
 static void sensor_timer_expiry_handler(struct k_timer *timer)
 {
 	// set timer expiry event
+	LOG_DBG("Timer expiry");
 	k_event_set(&main_evts, MAIN_EVT_TIMER_EXPIRY);
+}
+
+static int start_adv()
+{
+	int ret = 0;
+	ret = bt_le_adv_start(BT_LE_ADV_CONN_NAME, adv_data, ARRAY_SIZE(adv_data), NULL, 0);
+	return ret;
+}
+
+static void stop_adv()
+{
+	int err = 0;
+	err = bt_le_adv_stop();
+	if(err){
+		LOG_ERR("Stop adv error");
+		return;
+	}
+	LOG_DBG("ADV stopped");
+}
+
+static int send_notification(const void *data, uint8_t len)
+{
+	return bt_gatt_notify(default_conn, &primary_service.attrs[3], data, len);
+}
+
+static bool notify_central(uint8_t status, int16_t temp, int16_t rh)
+{
+	int err = 0;
+	uint32_t evt = 0;
+	if(status == NOTIFY_STATUS_OK){
+		uint8_t data[] = {
+			NOTIFY_STATUS_OK,
+			(temp >> 8) & 0xff,
+			temp & 0xff,
+			(rh >> 8) & 0xff,
+			rh & 0xff
+		};
+
+		err = send_notification(data, sizeof(data));
+		if(err){
+			LOG_ERR("Notify error");
+			return false;
+		}
+	}
+	else if(status == NOTIFY_STATUS_ERROR){
+		uint8_t data = NOTIFY_STATUS_ERROR;
+		err = send_notification(&data, 1);
+		if(err){
+			LOG_ERR("Notify error");
+			return false;
+		}
+	}
+	else if(status == NOTIFY_STATUS_WAIT){
+		uint8_t data = NOTIFY_STATUS_WAIT;
+		err = send_notification(&data, 1);
+		if(err){
+			LOG_ERR("Notify error");
+			return false;
+		}	
+	}
+
+	return true;
+}
+
+static int wait_for_notification_enable()
+{
+	uint32_t evt = 0;
+	if(default_conn == NULL){
+		LOG_INF("Wait connection");
+		evt = k_event_wait(&main_evts, MAIN_EVT_BLE_CONNECTED, true, K_SECONDS(60));
+		if(!evt){
+			LOG_ERR("Timed out waiting for connection");
+			return -ETIMEDOUT;
+		}
+	}
+
+	if(!notifications_enabled){
+		LOG_INF("Wait notifications enable");
+		evt = k_event_wait(&main_evts, MAIN_EVT_BLE_NOTIFICATION_ENABLED, true, K_SECONDS(5));
+		if(!evt){
+			LOG_ERR("Timed out waiting for notification enable");
+			return -ETIMEDOUT;
+		}
+	}
+
+	return 0;
 }
 
 static int ble_init()
 {
 	int ret = 0;
-	ret = bt_enable(NULL);
-	if(ret){
-		LOG_ERR("Bluetooth enable error %d", ret);
-		return ret;
-	}
 
 	bt_conn_cb_register(&conn_callbacks);
 
@@ -263,7 +353,13 @@ static int ble_init()
 		return ret;
 	}
 
-	ret = bt_le_adv_start(BT_LE_ADV_CONN_NAME, adv_data, ARRAY_SIZE(adv_data), NULL, 0);
+	ret = bt_enable(NULL);
+	if(ret){
+		LOG_ERR("Bluetooth enable error %d", ret);
+		return ret;
+	}
+
+	ret = start_adv();
 	if(ret){
 		LOG_ERR("Error starting advertising");
 		return ret;
@@ -317,13 +413,9 @@ void main(void)
 {
 	int res = 0;
 	uint32_t event;
-	int16_t notify_buffer[2];
+	int16_t notify_buffer[3];
 	if(ble_init()){
 		return;
-	}
-
-	if(sht41_init()){
-		// return;
 	}
 
 	while(1){
@@ -333,24 +425,38 @@ void main(void)
 			continue;
 		}
 
+		res = start_adv();
+		if(res){
+			LOG_ERR("ADV start error %d", res);
+			continue;
+		}
+
+		// Wait for notifications enable
+		res = wait_for_notification_enable();
+		if(res){
+			stop_adv();
+			continue;
+		}
+
+		res = sht41_init();
+		if(res){
+			LOG_ERR("sensor not available");
+			notify_central(NOTIFY_STATUS_ERROR, 0, 0);
+			continue;
+		}
+
 		res = sht41_fetch_data();
 		if(res){
 			LOG_ERR("Error %d fetching sensor data", res);
 			// restart timer with shorter duration
-			k_timer_start(&sensor_timer, K_SECONDS(15), K_SECONDS(15));
+			notify_central(NOTIFY_STATUS_WAIT, 0, 0);
+			k_timer_start(&sensor_timer, K_SECONDS(5), K_NO_WAIT);
 			continue;
 		}
 
-		if(notifications_enabled){
-			notify_buffer[0] = (int16_t)(sht41_sensor_data.temp * 100);
-			notify_buffer[1] = (int16_t)(sht41_sensor_data.rh * 100);
-
-			res = bt_gatt_notify(conn, &primary_service.attrs[3], (const void *)notify_buffer, sizeof(notify_buffer));
-			if(res){
-				LOG_WRN("Notify error %d", res);
-				k_timer_start(&sensor_timer, K_SECONDS(15), K_SECONDS(15));				
-				continue;
-			}
+		if(!notify_central(NOTIFY_STATUS_OK, (sht41_sensor_data.temp * 100), (sht41_sensor_data.rh * 100))){
+			k_timer_start(&sensor_timer, K_SECONDS(15), K_SECONDS(15));				
+			continue;
 		}
 
 		event = k_event_wait(&main_evts, MAIN_EVT_BLE_RESP_RECEIVED, true, K_SECONDS(5));
@@ -360,7 +466,20 @@ void main(void)
 			continue;
 		}
 
+		res = bt_conn_disconnect(default_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		if(res){
+			LOG_ERR("BLE disconnect error %d", res);
+			continue;
+		}
+
+		event = k_event_wait(&main_evts, MAIN_EVT_BLE_DISCONNECTED, true, K_SECONDS(5));
+		if(!event){
+			LOG_ERR("Disconnect timeout");
+			continue;
+		}
+
+		stop_adv();
 		// reset timer
-		k_timer_start(&sensor_timer, K_MINUTES(TIMER_INTERVAL_MINUTES), K_MINUTES(TIMER_INTERVAL_MINUTES));
+		k_timer_start(&sensor_timer, K_SECONDS(15), K_NO_WAIT);
 	}
 }
