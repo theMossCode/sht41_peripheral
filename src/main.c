@@ -26,14 +26,15 @@ LOG_MODULE_REGISTER(MAIN);
 #define RX_UUID				BT_UUID_128_ENCODE(0xedd1a5f3, 0xdbb2, 0x4b29, 0xb449, 0xa4be5161f18e)
 #define TX_UUID				BT_UUID_128_ENCODE(0xedd1a5f3, 0xdbb3, 0x4b29, 0xb449, 0xa4be5161f18e)
 
-#define MAIN_EVT_TIMER_EXPIRY			0x01
-#define MAIN_EVT_BLE_RESP_RECEIVED		0x02
+#define MAIN_EVT_TIMER_EXPIRY				0x01
+#define MAIN_EVT_BLE_RESP_RECEIVED			0x02
+#define MAIN_EVT_BLE_CONN_PARAMS_UPDATED	0x04
 
-#define TIMER_INTERVAL_MINUTES			15
+#define TIMER_INTERVAL_MINUTES				15
 
-#define BLE_PASSKEY						123456
+#define BLE_PASSKEY							123456
 
-#define SHT41_NODE						DT_NODELABEL(sht41)
+#define SHT41_NODE							DT_NODELABEL(sht41)
 
 struct sht41_data{
 	double temp;
@@ -46,6 +47,7 @@ static void tx_chr_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value);
 
 static void connected_cb(struct bt_conn *conn, uint8_t err);
 static void disconnected_cb(struct bt_conn *conn, uint8_t reason);
+static void conn_params_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency, uint16_t timeout);
 static void security_changed_cb(struct bt_conn *conn, bt_security_t level, enum bt_security_err err);
 
 static void pair_cancel(struct bt_conn *conn);
@@ -62,12 +64,13 @@ static void sensor_timer_expiry_handler(struct k_timer *timer);
 const struct bt_uuid_128 main_service_uuid = BT_UUID_INIT_128(MAIN_SERVICE_UUID);
 const struct bt_uuid_128 tx_uuid = BT_UUID_INIT_128(TX_UUID);
 const struct bt_uuid_128 rx_uuid = BT_UUID_INIT_128(RX_UUID);
-struct bt_conn *conn;
+struct bt_conn *default_conn;
 
 struct bt_conn_cb conn_callbacks = {
 	.connected = connected_cb,
 	.disconnected = disconnected_cb,
-	.security_changed = security_changed_cb
+	.security_changed = security_changed_cb,
+	.le_param_updated = conn_params_updated,
 };
 struct bt_conn_auth_cb conn_auth_callbacks = {
 	.cancel = pair_cancel,
@@ -80,6 +83,8 @@ struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
 	.pairing_failed = pairing_failed,
 	.bond_deleted = bond_deleted
 };
+
+struct bt_le_conn_param conn_params = BT_LE_CONN_PARAM_INIT(360, 480, 2, 600);
 
 bool notifications_enabled = false;
 
@@ -139,6 +144,11 @@ static void tx_chr_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 		// start timer
 		k_timer_start(&sensor_timer, K_MINUTES(TIMER_INTERVAL_MINUTES), K_MINUTES(TIMER_INTERVAL_MINUTES));
 		LOG_INF("TX notifications enabled");
+		
+		int res = bt_conn_le_param_update(default_conn, &conn_params);
+		if(res){
+			LOG_ERR("Update params error %d", res);
+		}
 	}
 	else{
 		notifications_enabled = false;
@@ -151,13 +161,14 @@ static void tx_chr_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 static void connected_cb(struct bt_conn *conn, uint8_t err)
 {
 	LOG_INF("Device connected, %d", err);
-	bt_conn_ref(conn);
+	default_conn = bt_conn_ref(conn);
 }
 
 static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 {
 	LOG_WRN("Device disconnected %d", reason);
 	bt_conn_unref(conn);
+	default_conn = NULL;
 }
 
 static void security_changed_cb(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
@@ -168,6 +179,13 @@ static void security_changed_cb(struct bt_conn *conn, bt_security_t level, enum 
 	}
 
 	LOG_DBG("Security updated to %d", level);
+}
+
+static void conn_params_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency, uint16_t timeout)
+{
+	interval *= 1.25;
+	timeout *= 10;
+	LOG_INF("Params updated\r\nInterval:%u\r\nLatency:%u\r\nTimeout: %u", interval, latency, timeout);
 }
 
 static void pair_cancel(struct bt_conn *conn)
@@ -322,14 +340,16 @@ void main(void)
 		return;
 	}
 
-	if(sht41_init()){
-		// return;
-	}
-
 	while(1){
 		event = k_event_wait(&main_evts, MAIN_EVT_TIMER_EXPIRY, true, K_FOREVER);
 		if(!(event & MAIN_EVT_TIMER_EXPIRY)){
 			LOG_WRN("Unexpected event %d", event);
+			continue;
+		}
+
+		res = sht41_init();
+		if(res){
+			LOG_ERR("Sensor not available");
 			continue;
 		}
 
@@ -345,7 +365,7 @@ void main(void)
 			notify_buffer[0] = (int16_t)(sht41_sensor_data.temp * 100);
 			notify_buffer[1] = (int16_t)(sht41_sensor_data.rh * 100);
 
-			res = bt_gatt_notify(conn, &primary_service.attrs[3], (const void *)notify_buffer, sizeof(notify_buffer));
+			res = bt_gatt_notify(default_conn, &primary_service.attrs[3], (const void *)notify_buffer, sizeof(notify_buffer));
 			if(res){
 				LOG_WRN("Notify error %d", res);
 				k_timer_start(&sensor_timer, K_SECONDS(15), K_SECONDS(15));				
@@ -359,7 +379,6 @@ void main(void)
 			k_timer_start(&sensor_timer, K_SECONDS(15), K_SECONDS(15));
 			continue;
 		}
-
 		// reset timer
 		k_timer_start(&sensor_timer, K_MINUTES(TIMER_INTERVAL_MINUTES), K_MINUTES(TIMER_INTERVAL_MINUTES));
 	}
